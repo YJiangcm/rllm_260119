@@ -2,18 +2,22 @@
 
 ## One-Line Summary
 
-rLLM's **SDK-based pipeline** (`AgentSdkEngine`) captures token IDs directly from vLLM's inference engine and uses them as-is for training - no retokenization ever occurs.
+rLLM's training pipelines capture token IDs directly from vLLM's inference engine and use them as-is for training - no retokenization ever occurs.
 
-> **⚠️ Important**: This applies to `AgentSdkEngine` only. The legacy `AgentExecutionEngine` retokenizes messages and does NOT guarantee zero retokenization.
+**Both `AgentSdkEngine` and `AgentExecutionEngine` guarantee zero retokenization.**
 
 ## Engine Comparison
 
-| Engine | Retokenization? | Token ID Fidelity | Use Case |
-|--------|----------------|-------------------|----------|
-| **AgentSdkEngine** ✅ | ❌ No | ✅ 100% | SDK workflows, production |
-| **AgentExecutionEngine** ⚠️ | ✅ Yes | ⚠️ Variable | Legacy examples only |
+| Engine | Retokenization? | Token ID Source | Use Case |
+|--------|----------------|-----------------|----------|
+| **AgentSdkEngine** ✅ | ❌ No | vLLM (via traces) | SDK workflows, complex programs |
+| **AgentExecutionEngine** ✅ | ❌ No | vLLM (via episode_steps) | Agent-environment RL training |
 
-## Flow Diagram (AgentSdkEngine Only)
+Both engines use vLLM token IDs directly for training without retokenization.
+
+## Flow Diagram
+
+### AgentSdkEngine Pipeline
 
 ```
 vLLM Engine → LiteLLM Proxy → SQLite Trace Store → Training Pipeline
@@ -21,13 +25,23 @@ vLLM Engine → LiteLLM Proxy → SQLite Trace Store → Training Pipeline
   token_ids     token_ids         token_ids          token_ids
      ↓              ↓                 ↓                  ↓
   [1,2,3]       [1,2,3]           [1,2,3]            [1,2,3]
-     ↓              ↓                 ↓                  ↓
-  NO TEXT!      NO TOKENIZE!      IMMUTABLE!        NO TOKENIZE!
 ```
 
-**Note**: AgentExecutionEngine does NOT follow this flow - it retokenizes messages using `tokenizer.encode()`.
+### AgentExecutionEngine Pipeline
 
-## Key Files (AgentSdkEngine Pipeline)
+```
+vLLM Engine → ModelOutput → episode_steps → assemble_steps() → Training
+  (generates)   (captures)     (stores)         (uses)           (uses)
+  token_ids     token_ids      token_ids        token_ids        token_ids
+     ↓              ↓              ↓                ↓                ↓
+  [1,2,3]       [1,2,3]        [1,2,3]          [1,2,3]          [1,2,3]
+```
+
+**Both pipelines**: ✅ NO TEXT! ✅ NO TOKENIZE! ✅ TOKEN IDs ARE IMMUTABLE!
+
+## Key Files
+
+### AgentSdkEngine Pipeline
 
 | Component | File | Purpose |
 |-----------|------|---------|
@@ -37,7 +51,16 @@ vLLM Engine → LiteLLM Proxy → SQLite Trace Store → Training Pipeline
 | Store | `rllm/sdk/proxy/litellm_callbacks.py` | Persist traces to SQLite |
 | Train | `rllm/engine/agent_sdk_engine.py` | Transform to training format |
 
-**Legacy (AgentExecutionEngine)**: Uses `rllm/agents/utils.py:convert_messages_to_tokens_and_masks()` which **retokenizes** via `tokenizer.encode()`.
+### AgentExecutionEngine Pipeline
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Capture | `rllm/engine/rollout/verl_engine.py` | Get ModelOutput with token IDs from vLLM |
+| Store | `rllm/engine/agent_execution_engine.py:252-253` | Store in episode_steps |
+| Assemble | `rllm/engine/agent_execution_engine.py:446-481` | assemble_steps() uses vLLM token IDs |
+| Train | `rllm/trainer/verl/agent_ppo_trainer.py` | Use token data for training |
+
+**Note**: `convert_messages_to_tokens_and_masks()` in AgentExecutionEngine is only for runtime token counting, NOT for training data.
 
 ## Data Structures
 
@@ -75,14 +98,20 @@ ModelOutput(
 input_ids = torch.tensor([1, 2, 3, 4, 5, 6])  # ← Direct conversion
 ```
 
-## Why No Retokenization? (AgentSdkEngine Only)
+## Why No Retokenization?
+
+### Both Pipelines Guarantee Zero Retokenization
 
 1. **vLLM is source**: Token IDs come from `RequestOutput.prompt_token_ids` and `output.token_ids`
-2. **Immutable storage**: Stored in Trace, never modified
-3. **Direct pipeline**: `list[int]` → `Trace` → `ModelOutput` → `tensor` (pure data transforms)
-4. **No text used**: Text is for debugging only; training uses token IDs exclusively
+2. **Direct storage**: 
+   - AgentSdkEngine: Stored in SQLite Trace
+   - AgentExecutionEngine: Stored in episode_steps
+3. **Direct pipeline**: `list[int]` → storage → training (pure data transforms)
+4. **No text used for training**: Text is for debugging/runtime checks only
 
-⚠️ **AgentExecutionEngine does NOT follow this**: It calls `tokenizer.encode(msg_text)` in `convert_messages_to_tokens_and_masks()`, causing retokenization.
+### Common Misconception
+
+`AgentExecutionEngine` calls `convert_messages_to_tokens_and_masks()`, but this is **only for runtime token counting** (checking if prompts/responses exceed length limits). The actual training data comes from `episode_steps` which contains the original vLLM token IDs stored at lines 252-253.
 
 ## Quick Setup
 

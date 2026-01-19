@@ -2,9 +2,13 @@
 
 ## Overview
 
-This document explains how rLLM's **SDK-based training pipeline** (`AgentSdkEngine`) captures token IDs directly from the vLLM inference server, stores them, and uses them for training **without any retokenization**. This design ensures 100% fidelity between inference and training tokens.
+This document explains how rLLM captures token IDs directly from the vLLM inference server, stores them, and uses them for training **without any retokenization**. This design ensures 100% fidelity between inference and training tokens.
 
-> **⚠️ Important**: This documentation applies specifically to the **SDK-based training pipeline** using `AgentSdkEngine`. The legacy `AgentExecutionEngine` pipeline (used in examples like `train_deepswe_32b.sh`) does **NOT** guarantee zero retokenization. See [Engine Comparison](#engine-comparison) below.
+**Both major training pipelines in rLLM guarantee zero retokenization**:
+- **`AgentSdkEngine`**: SDK-based workflow training with SQLite trace storage
+- **`AgentExecutionEngine`**: Traditional agent-environment RL training with in-memory storage
+
+Both use vLLM token IDs directly without retokenization. See [Engine Comparison](#engine-comparison) for details.
 
 ## Why This Matters
 
@@ -15,7 +19,7 @@ This document explains how rLLM's **SDK-based training pipeline** (`AgentSdkEngi
 
 This introduces tokenization mismatches that can harm training quality.
 
-**Solution**: The SDK-based pipeline captures token IDs directly from vLLM's internal engine and uses them as-is for training, eliminating retokenization entirely.
+**Solution**: rLLM captures token IDs directly from vLLM's internal engine and uses them as-is for training, eliminating retokenization entirely.
 
 ## Architecture Overview
 
@@ -372,49 +376,51 @@ token_ids  capture    store as-is   extract IDs  use directly
 - `rllm/sdk/data_process.py:trace_to_model_output()` - Extracts token IDs directly
 - `rllm/engine/agent_sdk_engine.py:transform_results_for_verl()` - Uses token IDs for training
 
-**Guarantees**: ✅ **No retokenization** - Token IDs flow as immutable `list[int]` through the entire pipeline.
+**Features**:
+- ✅ **No retokenization** - Token IDs flow as immutable `list[int]` through the entire pipeline
+- ✅ **SQLite trace storage** - Full trace history with metadata
+- ✅ **Async execution** - Better for complex workflows with multiple LLM calls
+- ✅ **Flexible grouping** - Can group steps into trajectories with custom logic
 
-### AgentExecutionEngine (Legacy Pipeline) ⚠️ Retokenization May Occur
+### AgentExecutionEngine (Agent-Environment Pipeline) ✅ Also Zero Retokenization
 
 **Used by**: Traditional agent training (`train_deepswe_32b.sh`, `train_frozenlake_agent.sh`)
 
 **Token Flow**:
 ```
-vLLM → ModelOutput (stores IDs) → convert_messages_to_tokens_and_masks() → Training
- ↓           ↓                            ↓                                    ↓
-token_ids   capture                 RETOKENIZE text!                    uses retokenized
+vLLM → ModelOutput → episode_steps → assemble_steps() → Training
+ ↓         ↓             ↓                 ↓               ↓
+token_ids  capture   store IDs        use vLLM IDs   use directly
 ```
 
 **Key Code Paths**:
 - `rllm/engine/rollout/verl_engine.py` - Returns `ModelOutput` with token IDs from vLLM
-- `rllm/engine/agent_execution_engine.py:252-253` - **Stores** token IDs in episode_steps
-- `rllm/engine/agent_execution_engine.py:306-308` - **Retokenizes** via `convert_messages_to_tokens_and_masks()`
-- `rllm/agents/utils.py:64` - Calls `tokenizer.encode(msg_text)` - **This is retokenization!**
-- `rllm/engine/agent_execution_engine.py:446-481` - Uses retokenized tokens for training
+- `rllm/engine/agent_execution_engine.py:252-253` - **Stores** vLLM token IDs in `episode_steps`
+- `rllm/engine/agent_execution_engine.py:446-481` - **`assemble_steps()` uses stored vLLM token IDs**
+- Training uses token IDs directly from vLLM via `episode_steps`
 
-**Issue**: ⚠️ Even though token IDs are captured from vLLM, they are **not used** for training. Instead, the messages are converted back to text and retokenized via `tokenizer.encode()`. Line 472 even warns: _"This is likely due to retokenization"_.
+**Features**:
+- ✅ **No retokenization** - Uses vLLM token IDs stored in `episode_steps`
+- ✅ **Agent-environment loop** - Direct integration with gym-style environments
+- ✅ **Step-by-step execution** - One LLM call per step with environment feedback
+- ⚠️ **In-memory only** - No persistent trace storage (unless using SDK mode)
 
-**Why It Happens**:
-1. vLLM returns `ModelOutput(prompt_ids=[...], completion_ids=[...])`
-2. These are stored but then ignored
-3. Agent updates its `chat_completions` (text messages)
-4. `convert_messages_to_tokens_and_masks()` re-parses and retokenizes these messages
-5. Training uses the retokenized version, not the original vLLM token IDs
+**Important Note**: `convert_messages_to_tokens_and_masks()` is called in this pipeline (lines 216, 306-308) but is **only used for runtime token counting** (checking prompt/response length limits), NOT for training data. The actual training data comes from `episode_steps` which contains the original vLLM token IDs.
 
 ### Which Should You Use?
 
-| Feature | AgentSdkEngine ✅ | AgentExecutionEngine ⚠️ |
-|---------|------------------|------------------------|
-| **Zero Retokenization** | ✅ Yes | ❌ No (retokenizes messages) |
-| **Token ID Fidelity** | ✅ 100% | ⚠️ Depends on tokenizer consistency |
+| Feature | AgentSdkEngine | AgentExecutionEngine |
+|---------|----------------|----------------------|
+| **Zero Retokenization** | ✅ Yes | ✅ Yes |
+| **Token ID Source** | vLLM (via traces) | vLLM (via episode_steps) |
 | **Trace Storage** | ✅ SQLite with full context | ❌ In-memory only |
-| **Use Case** | SDK workflows, production training | Legacy agent examples |
-| **Recommended** | ✅ For new projects | ⚠️ Legacy support only |
+| **Workflow Complexity** | Complex multi-step workflows | Sequential agent-env loops |
+| **Use Case** | SDK workflows, multi-agent | Traditional RL agents |
+| **Best For** | Flexible agentic programs | Gym-style environment training |
 
-**Migration Path**: If you're using `AgentExecutionEngine` and need zero retokenization:
-1. Migrate to SDK-based workflow using `AgentSdkEngine`
-2. See `examples/sdk/` for reference implementations
-3. Use `@traced_session()` decorator for your agent function
+**Both engines guarantee zero retokenization!** Choose based on your use case:
+- **AgentSdkEngine**: For complex workflows with trace storage and flexible execution
+- **AgentExecutionEngine**: For traditional agent-environment RL training
 
 ## Configuration
 
