@@ -49,6 +49,12 @@ class VerlEngine(RolloutEngine):
         application_id = kwargs.pop("application_id", str(uuid.uuid4()))
         validate = self.validate or kwargs.pop("validate", False)
         enforce_max_prompt_length = kwargs.pop("enforce_max_prompt_length", True)
+        
+        # NEW: Accept cached token IDs to avoid retokenization
+        # cached_prompt_ids should contain all tokens up to (but not including) the new messages
+        cached_prompt_ids = kwargs.pop("cached_prompt_ids", None)
+        # num_cached_messages tells us how many messages are already tokenized in cached_prompt_ids
+        num_cached_messages = kwargs.pop("num_cached_messages", 0)
 
         # these go to the parser
         tools = kwargs.pop("tools", [])
@@ -59,8 +65,22 @@ class VerlEngine(RolloutEngine):
 
         max_tokens = sampling_params.pop("max_tokens", sampling_params.pop("max_new_tokens", self.max_response_length))
 
-        prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning)
-        request_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)  # list[int]
+        # NEW: Build prompt token IDs incrementally to avoid retokenization
+        if cached_prompt_ids is not None and num_cached_messages > 0:
+            # We have cached tokens for the first num_cached_messages messages
+            # Only tokenize the new messages
+            new_messages = messages[num_cached_messages:]
+            if new_messages:
+                # Parse only the new messages
+                new_prompt = self.chat_parser.parse(new_messages, add_generation_prompt=True, is_first_msg=False)
+                new_token_ids = self.tokenizer.encode(new_prompt, add_special_tokens=False)
+                request_prompt_ids = cached_prompt_ids + new_token_ids
+            else:
+                request_prompt_ids = cached_prompt_ids
+        else:
+            # No cache, tokenize everything (first step or cache disabled)
+            prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning)
+            request_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)  # list[int]
 
         if any(msg.get("images", None) is not None and msg["role"] == "user" for msg in messages) and self.processor is not None:
             image_data = self.chat_parser.process_image_data(messages)  # list[PIL.Image.Image]

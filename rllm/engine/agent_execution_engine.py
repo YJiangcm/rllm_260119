@@ -197,6 +197,11 @@ class AgentExecutionEngine:
 
         # for step return
         episode_steps = []
+        
+        # NEW: Cache accumulated token IDs to avoid retokenization
+        # Track token IDs from prompt + completions across steps
+        accumulated_token_ids = []
+        num_cached_messages = 0  # Number of messages already represented in accumulated_token_ids
 
         # Reset environment with the task using the executor
         loop = asyncio.get_event_loop()
@@ -238,6 +243,12 @@ class AgentExecutionEngine:
                     break
 
             kwargs["max_tokens"] = max_tokens
+            
+            # NEW: Pass cached token IDs to avoid retokenization
+            # Only pass cache if we have accumulated tokens from previous steps
+            if step_idx > 0 and accumulated_token_ids:
+                kwargs["cached_prompt_ids"] = accumulated_token_ids.copy()
+                kwargs["num_cached_messages"] = num_cached_messages
 
             start_time = time.time()
             model_output = await self.get_model_response(prompt_messages, application_id, **kwargs)
@@ -245,6 +256,7 @@ class AgentExecutionEngine:
             delta_time = time.time() - start_time
             llm_time += delta_time
             total_time += delta_time
+            
             # Update steps
             prompt_response_pair = {
                 "prompt": self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True),
@@ -254,6 +266,12 @@ class AgentExecutionEngine:
                 "logprobs": model_output.logprobs,
             }
             episode_steps.append(prompt_response_pair)
+            
+            # NEW: Update accumulated token IDs
+            # After this step: we have all tokens from prompt + completion
+            accumulated_token_ids = model_output.prompt_ids + model_output.completion_ids
+            # The number of messages now includes all messages up to and including the assistant response
+            num_cached_messages = len(prompt_messages) + 1  # +1 for assistant message
 
             # Update agent with model response
             action: Action = agent.update_from_model(response)
