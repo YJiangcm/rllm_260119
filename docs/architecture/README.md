@@ -4,9 +4,13 @@ This directory contains detailed architectural documentation for the rLLM framew
 
 ## Documents
 
-### [Token ID Capture Flow](token_id_capture_flow.md)
+### [Quick Reference: Token ID Flow](quick_reference.md) ⚡
 
-Explains how rLLM captures token IDs directly from vLLM inference servers and uses them for training without any retokenization. This ensures 100% fidelity between inference and training tokens.
+One-page quick reference showing how token IDs flow from vLLM to training. Perfect for a quick overview.
+
+### [Token ID Capture Flow](token_id_capture_flow.md) 📖
+
+Comprehensive technical documentation explaining how rLLM captures token IDs directly from vLLM inference servers and uses them for training without any retokenization. This ensures 100% fidelity between inference and training tokens.
 
 **Key Topics**:
 - vLLM instrumentation mechanism for token ID capture

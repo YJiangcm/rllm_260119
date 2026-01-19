@@ -83,6 +83,7 @@ nav:
         - RL Algorithms for Agents: core-concepts/rl-algos.md
         - SDK Overview: core-concepts/sdk.md
       - Architecture:
+        - Quick Reference: architecture/quick_reference.md
         - Token ID Capture Flow: architecture/token_id_capture_flow.md
       - Examples:
         - Training a LangGraph Search Agent using the rLLM SDK: examples/sdk_langgraph_rag.md
@@ -109,6 +110,7 @@ nav:
       - SDK Overview: core-concepts/sdk.md
       - Eval Protocol Integration: core-concepts/eval-protocol.md
   - Architecture:
+      - Quick Reference: architecture/quick_reference.md
       - Token ID Capture Flow: architecture/token_id_capture_flow.md
   - Examples:
       - Overview: examples/index.md
