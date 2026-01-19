@@ -82,6 +82,9 @@ nav:
         - AgentTrainer for RL Training: core-concepts/training.md
         - RL Algorithms for Agents: core-concepts/rl-algos.md
         - SDK Overview: core-concepts/sdk.md
+      - Architecture:
+        - Quick Reference: architecture/quick_reference.md
+        - Token ID Capture Flow: architecture/token_id_capture_flow.md
       - Examples:
         - Training a LangGraph Search Agent using the rLLM SDK: examples/sdk_langgraph_rag.md
         - RL Training with Tinker: examples/tinker_rl.md
@@ -106,6 +109,9 @@ nav:
       - RL Algorithms for Agents: core-concepts/rl-algos.md
       - SDK Overview: core-concepts/sdk.md
       - Eval Protocol Integration: core-concepts/eval-protocol.md
+  - Architecture:
+      - Quick Reference: architecture/quick_reference.md
+      - Token ID Capture Flow: architecture/token_id_capture_flow.md
   - Examples:
       - Overview: examples/index.md
       - Math Agent with rLLM SDK: examples/sdk_math.md
