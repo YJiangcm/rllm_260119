@@ -2,13 +2,9 @@
 
 ## Overview
 
-This document explains how rLLM captures token IDs directly from the vLLM inference server, stores them, and uses them for training **without any retokenization**. This design ensures 100% fidelity between inference and training tokens.
+This document explains how rLLM's **SDK-based training pipeline** (`AgentSdkEngine`) captures token IDs directly from the vLLM inference server, stores them, and uses them for training **without any retokenization**. This design ensures 100% fidelity between inference and training tokens.
 
-**Both major training pipelines in rLLM guarantee zero retokenization**:
-- **`AgentSdkEngine`**: SDK-based workflow training with SQLite trace storage
-- **`AgentExecutionEngine`**: Traditional agent-environment RL training with in-memory storage
-
-Both use vLLM token IDs directly without retokenization. See [Engine Comparison](#engine-comparison) for details.
+> **⚠️ Important**: Only the **SDK-based training pipeline** (`AgentSdkEngine`) guarantees zero retokenization. The `AgentExecutionEngine` pipeline (used in examples like `train_deepswe_32b.sh`) retokenizes prompts at each step. See [Engine Comparison](#engine-comparison) for details.
 
 ## Why This Matters
 
@@ -19,7 +15,7 @@ Both use vLLM token IDs directly without retokenization. See [Engine Comparison]
 
 This introduces tokenization mismatches that can harm training quality.
 
-**Solution**: rLLM captures token IDs directly from vLLM's internal engine and uses them as-is for training, eliminating retokenization entirely.
+**Solution**: The SDK-based pipeline captures token IDs directly from vLLM's internal engine and uses them as-is for training, eliminating retokenization entirely.
 
 ## Architecture Overview
 
@@ -377,50 +373,64 @@ token_ids  capture    store as-is   extract IDs  use directly
 - `rllm/engine/agent_sdk_engine.py:transform_results_for_verl()` - Uses token IDs for training
 
 **Features**:
-- ✅ **No retokenization** - Token IDs flow as immutable `list[int]` through the entire pipeline
+- ✅ **Zero retokenization** - Both prompts and completions use vLLM token IDs
 - ✅ **SQLite trace storage** - Full trace history with metadata
 - ✅ **Async execution** - Better for complex workflows with multiple LLM calls
 - ✅ **Flexible grouping** - Can group steps into trajectories with custom logic
 
-### AgentExecutionEngine (Agent-Environment Pipeline) ✅ Also Zero Retokenization
+### AgentExecutionEngine (Agent-Environment Pipeline) ⚠️ Partial Retokenization
 
 **Used by**: Traditional agent training (`train_deepswe_32b.sh`, `train_frozenlake_agent.sh`)
 
 **Token Flow**:
 ```
-vLLM → ModelOutput → episode_steps → assemble_steps() → Training
+vLLM → VerlEngine → episode_steps → assemble_steps() → Training
  ↓         ↓             ↓                 ↓               ↓
-token_ids  capture   store IDs        use vLLM IDs   use directly
+token_ids  ⚠️RETOKENIZE  store mixed      detect mismatch  mask if invalid
+          (prompts)     IDs              
 ```
 
 **Key Code Paths**:
-- `rllm/engine/rollout/verl_engine.py` - Returns `ModelOutput` with token IDs from vLLM
-- `rllm/engine/agent_execution_engine.py:252-253` - **Stores** vLLM token IDs in `episode_steps`
-- `rllm/engine/agent_execution_engine.py:446-481` - **`assemble_steps()` uses stored vLLM token IDs**
-- Training uses token IDs directly from vLLM via `episode_steps`
+- `rllm/engine/rollout/verl_engine.py:62-63` - **Retokenizes prompts** via `tokenizer.encode()`
+- `rllm/engine/rollout/verl_engine.py:81` - Gets completion IDs from vLLM ✅
+- `rllm/engine/agent_execution_engine.py:252-253` - Stores mixed token IDs in `episode_steps`
+- `rllm/engine/agent_execution_engine.py:462-477` - Detects token mismatches and sets `is_valid_trajectory = False`
+- `rllm/engine/agent_execution_engine.py:489-490` - Masks trajectories with mismatches if `config.rllm.filter_token_mismatch = True`
+
+**The Problem**:
+```python
+# In VerlEngine.get_model_response() (verl_engine.py:62-63):
+prompt = self.chat_parser.parse(messages, ...)  # Convert to text
+request_prompt_ids = self.tokenizer.encode(prompt, ...)  # RETOKENIZE!
+
+# Result:
+model_output.prompt_ids = request_prompt_ids  # Retokenized (not from vLLM)
+model_output.completion_ids = token_output.token_ids  # From vLLM ✅
+```
 
 **Features**:
-- ✅ **No retokenization** - Uses vLLM token IDs stored in `episode_steps`
-- ✅ **Agent-environment loop** - Direct integration with gym-style environments
-- ✅ **Step-by-step execution** - One LLM call per step with environment feedback
-- ⚠️ **In-memory only** - No persistent trace storage (unless using SDK mode)
+- ✅ **Completions from vLLM** - Response token IDs come from vLLM
+- ⚠️ **Prompts retokenized** - Prompt token IDs are retokenized by local tokenizer at each step
+- ⚠️ **Mismatch detection** - `assemble_steps()` detects when prompts don't align across steps
+- ⚠️ **Masking invalid trajectories** - Trajectories with mismatches can be masked out (if `filter_token_mismatch = True`)
 
-**Important Note**: `convert_messages_to_tokens_and_masks()` is called in this pipeline (lines 216, 306-308) but is **only used for runtime token counting** (checking prompt/response length limits), NOT for training data. The actual training data comes from `episode_steps` which contains the original vLLM token IDs.
+**Why Mismatches Occur**:
+In multi-step agent-environment interactions, each step's prompt includes previous responses. If these are retokenized differently than vLLM tokenized them originally, the sequences won't align properly. `assemble_steps()` detects this and warns: _"This is likely due to retokenization"_ (line 472).
 
 ### Which Should You Use?
 
 | Feature | AgentSdkEngine | AgentExecutionEngine |
 |---------|----------------|----------------------|
-| **Zero Retokenization** | ✅ Yes | ✅ Yes |
-| **Token ID Source** | vLLM (via traces) | vLLM (via episode_steps) |
+| **Prompt Token IDs** | ✅ From vLLM (via traces) | ⚠️ Retokenized by local tokenizer |
+| **Completion Token IDs** | ✅ From vLLM (via traces) | ✅ From vLLM |
+| **Zero Retokenization** | ✅ Yes | ❌ No (prompts retokenized) |
+| **Token Mismatch Detection** | N/A (no mismatches) | ✅ Yes (via `assemble_steps()`) |
 | **Trace Storage** | ✅ SQLite with full context | ❌ In-memory only |
 | **Workflow Complexity** | Complex multi-step workflows | Sequential agent-env loops |
 | **Use Case** | SDK workflows, multi-agent | Traditional RL agents |
-| **Best For** | Flexible agentic programs | Gym-style environment training |
+| **Recommended For** | ✅ Production, new projects | ⚠️ Simple agents, legacy code |
 
-**Both engines guarantee zero retokenization!** Choose based on your use case:
-- **AgentSdkEngine**: For complex workflows with trace storage and flexible execution
-- **AgentExecutionEngine**: For traditional agent-environment RL training
+**For zero retokenization guarantee, use `AgentSdkEngine`**. `AgentExecutionEngine` retokenizes prompts at each step, though it attempts to detect and mask problematic trajectories.
 
 ## Configuration
 

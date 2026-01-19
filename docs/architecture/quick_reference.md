@@ -2,22 +2,20 @@
 
 ## One-Line Summary
 
-rLLM's training pipelines capture token IDs directly from vLLM's inference engine and use them as-is for training - no retokenization ever occurs.
+rLLM's **SDK-based pipeline** (`AgentSdkEngine`) captures token IDs directly from vLLM's inference engine and uses them as-is for training - no retokenization ever occurs.
 
-**Both `AgentSdkEngine` and `AgentExecutionEngine` guarantee zero retokenization.**
+> **⚠️ Important**: `AgentExecutionEngine` retokenizes prompts at each step. Only `AgentSdkEngine` guarantees zero retokenization.
 
 ## Engine Comparison
 
-| Engine | Retokenization? | Token ID Source | Use Case |
-|--------|----------------|-----------------|----------|
-| **AgentSdkEngine** ✅ | ❌ No | vLLM (via traces) | SDK workflows, complex programs |
-| **AgentExecutionEngine** ✅ | ❌ No | vLLM (via episode_steps) | Agent-environment RL training |
-
-Both engines use vLLM token IDs directly for training without retokenization.
+| Engine | Prompt Token IDs | Completion Token IDs | Zero Retokenization? |
+|--------|------------------|---------------------|---------------------|
+| **AgentSdkEngine** ✅ | From vLLM (via traces) | From vLLM (via traces) | ✅ Yes |
+| **AgentExecutionEngine** ⚠️ | Retokenized locally | From vLLM | ❌ No (prompts retokenized) |
 
 ## Flow Diagram
 
-### AgentSdkEngine Pipeline
+### AgentSdkEngine Pipeline ✅ Zero Retokenization
 
 ```
 vLLM Engine → LiteLLM Proxy → SQLite Trace Store → Training Pipeline
@@ -27,21 +25,25 @@ vLLM Engine → LiteLLM Proxy → SQLite Trace Store → Training Pipeline
   [1,2,3]       [1,2,3]           [1,2,3]            [1,2,3]
 ```
 
-### AgentExecutionEngine Pipeline
+### AgentExecutionEngine Pipeline ⚠️ Prompts Retokenized
 
 ```
-vLLM Engine → ModelOutput → episode_steps → assemble_steps() → Training
-  (generates)   (captures)     (stores)         (uses)           (uses)
-  token_ids     token_ids      token_ids        token_ids        token_ids
-     ↓              ↓              ↓                ↓                ↓
-  [1,2,3]       [1,2,3]        [1,2,3]          [1,2,3]          [1,2,3]
+vLLM Engine → VerlEngine → episode_steps → assemble_steps() → Training
+  (generates)  (RETOKENIZE     (stores        (detects           (uses)
+  token_ids     prompts!)      mixed IDs)      mismatches)       mixed IDs)
+     ↓              ↓               ↓              ↓                ↓
+  [1,2,3]      [1,2,3] ⚠️      [1,2,3] ⚠️    mask if invalid   [1,2,3] ⚠️
+               (prompt)         (prompt)                        (prompt)
+               [4,5,6] ✅      [4,5,6] ✅                       [4,5,6] ✅
+               (completion)     (completion)                    (completion)
 ```
 
-**Both pipelines**: ✅ NO TEXT! ✅ NO TOKENIZE! ✅ TOKEN IDs ARE IMMUTABLE!
+**AgentSdkEngine**: ✅ NO RETOKENIZATION - Both prompts and completions from vLLM  
+**AgentExecutionEngine**: ⚠️ PROMPTS RETOKENIZED - Only completions from vLLM
 
 ## Key Files
 
-### AgentSdkEngine Pipeline
+### AgentSdkEngine Pipeline (Zero Retokenization) ✅
 
 | Component | File | Purpose |
 |-----------|------|---------|
@@ -51,16 +53,16 @@ vLLM Engine → ModelOutput → episode_steps → assemble_steps() → Training
 | Store | `rllm/sdk/proxy/litellm_callbacks.py` | Persist traces to SQLite |
 | Train | `rllm/engine/agent_sdk_engine.py` | Transform to training format |
 
-### AgentExecutionEngine Pipeline
+### AgentExecutionEngine Pipeline (Prompts Retokenized) ⚠️
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| Capture | `rllm/engine/rollout/verl_engine.py` | Get ModelOutput with token IDs from vLLM |
-| Store | `rllm/engine/agent_execution_engine.py:252-253` | Store in episode_steps |
-| Assemble | `rllm/engine/agent_execution_engine.py:446-481` | assemble_steps() uses vLLM token IDs |
-| Train | `rllm/trainer/verl/agent_ppo_trainer.py` | Use token data for training |
-
-**Note**: `convert_messages_to_tokens_and_masks()` in AgentExecutionEngine is only for runtime token counting, NOT for training data.
+| Capture | `rllm/engine/rollout/verl_engine.py:81` | Get completion IDs from vLLM ✅ |
+| **Retokenize** | `rllm/engine/rollout/verl_engine.py:62-63` | **Retokenize prompts** ⚠️ |
+| Store | `rllm/engine/agent_execution_engine.py:252-253` | Store mixed token IDs in episode_steps |
+| Detect | `rllm/engine/agent_execution_engine.py:462-477` | Detect token mismatches in assemble_steps() |
+| Mask | `rllm/engine/agent_execution_engine.py:489-490` | Mask invalid trajectories |
+| Train | `rllm/trainer/verl/agent_ppo_trainer.py` | Use mixed token IDs for training ⚠️ |
 
 ## Data Structures
 
@@ -100,18 +102,31 @@ input_ids = torch.tensor([1, 2, 3, 4, 5, 6])  # ← Direct conversion
 
 ## Why No Retokenization?
 
-### Both Pipelines Guarantee Zero Retokenization
+### AgentSdkEngine ✅
 
-1. **vLLM is source**: Token IDs come from `RequestOutput.prompt_token_ids` and `output.token_ids`
-2. **Direct storage**: 
-   - AgentSdkEngine: Stored in SQLite Trace
-   - AgentExecutionEngine: Stored in episode_steps
-3. **Direct pipeline**: `list[int]` → storage → training (pure data transforms)
-4. **No text used for training**: Text is for debugging/runtime checks only
+1. **vLLM is source**: Both prompt and completion token IDs come from vLLM
+2. **Immutable storage**: Stored in SQLite Trace, never modified
+3. **Direct pipeline**: `list[int]` → `Trace` → `ModelOutput` → `tensor` (pure data transforms)
+4. **No text used for training**: Text is for debugging only
 
-### Common Misconception
+### AgentExecutionEngine ⚠️
 
-`AgentExecutionEngine` calls `convert_messages_to_tokens_and_masks()`, but this is **only for runtime token counting** (checking if prompts/responses exceed length limits). The actual training data comes from `episode_steps` which contains the original vLLM token IDs stored at lines 252-253.
+**Completions**: ✅ From vLLM (`token_output.token_ids`)  
+**Prompts**: ❌ Retokenized by local tokenizer
+
+```python
+# In VerlEngine.get_model_response() (verl_engine.py:62-63):
+prompt = self.chat_parser.parse(messages, ...)  # Convert to text
+request_prompt_ids = self.tokenizer.encode(prompt, ...)  # RETOKENIZE!
+```
+
+**Detection & Mitigation**:
+- `assemble_steps()` detects when token sequences don't align across steps
+- Warns: _"This is likely due to retokenization"_ (line 472)
+- Sets `is_valid_trajectory = False`
+- If `config.rllm.filter_token_mismatch = True`, masks the trajectory
+
+**For guaranteed zero retokenization, use `AgentSdkEngine`**.
 
 ## Quick Setup
 
